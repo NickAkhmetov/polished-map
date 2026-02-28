@@ -1,36 +1,252 @@
-name: CI
+name: Build and Release
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
+    tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 jobs:
-  build:
+
+  # ── Linux ─────────────────────────────────────────────────────────────────
+
+  build-linux:
+    name: Build (Linux)
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
 
       - name: Install dependencies
         run: |
-          sudo apt-get install -y git zlib1g-dev libpng-dev libxpm-dev libx11-dev libxft-dev libxinerama-dev libfontconfig1-dev x11proto-xext-dev libxrender-dev libxfixes-dev libcairo2-dev libpango1.0-dev
+          sudo apt-get update
+          sudo apt-get install -y \
+            zlib1g-dev libpng-dev libxpm-dev libx11-dev libxft-dev \
+            libxinerama-dev libfontconfig1-dev x11proto-xext-dev \
+            libxrender-dev libxfixes-dev libcairo2-dev libpango1.0-dev \
+            cmake imagemagick
 
       - name: Checkout FLTK
-        uses: actions/checkout@master
+        uses: actions/checkout@v4
         with:
-          path: lib/fltk
           repository: fltk/fltk
           ref: release-1.4.4
+          path: lib/fltk
           fetch-depth: 1
 
-      - name: Install FLTK
+      - name: Build FLTK
         working-directory: lib/fltk
         run: |
-          cmake -D CMAKE_INSTALL_PREFIX="$(realpath "$PWD/../..")" -D CMAKE_BUILD_TYPE=Release -D FLTK_GRAPHICS_CAIRO=1 -D FLTK_BACKEND_WAYLAND=0 -D FLTK_USE_SYSTEM_LIBPNG=0 -D FLTK_USE_SYSTEM_ZLIB=0 -D FLTK_BUILD_GL=0 -D FLTK_BUILD_TEST=0
-          make
-          make install
+          cmake -S . -B build \
+            -DCMAKE_INSTALL_PREFIX="$(realpath "$PWD/../..")" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFLTK_GRAPHICS_CAIRO=ON \
+            -DFLTK_BACKEND_WAYLAND=OFF \
+            -DFLTK_USE_SYSTEM_LIBPNG=OFF \
+            -DFLTK_USE_SYSTEM_ZLIB=OFF \
+            -DFLTK_BUILD_GL=OFF \
+            -DFLTK_BUILD_TEST=OFF
+          cmake --build build --parallel
+          cmake --install build
 
-      - name: Build
+      - name: Build Polished Map
+        run: make
+
+      - name: Create AppImage
         run: |
-          make
+          # Set up the AppDir structure
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications AppDir/usr/share/pixmaps
+          cp bin/polishedmap AppDir/usr/bin/polishedmap
+
+          # Convert XPM icon to PNG (appimagetool requires a raster icon)
+          convert res/app.xpm AppDir/polishedmap.png
+          cp AppDir/polishedmap.png AppDir/usr/share/pixmaps/polishedmap.png
+
+          # Desktop file — must live at the AppDir root for appimagetool
+          cat > AppDir/polishedmap.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=Polished Map
+          Comment=Edit pokecrystal maps and tilesets
+          Icon=polishedmap
+          Exec=polishedmap
+          Type=Application
+          Terminal=false
+          Categories=Development;
+          DESKTOP
+          cp AppDir/polishedmap.desktop AppDir/usr/share/applications/polishedmap.desktop
+
+          # AppRun entry-point
+          printf '#!/bin/sh\nexec "$(dirname "$0")/usr/bin/polishedmap" "$@"\n' > AppDir/AppRun
+          chmod +x AppDir/AppRun
+
+          # Download appimagetool (APPIMAGE_EXTRACT_AND_RUN=1 avoids needing FUSE)
+          wget -q \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage \
+            -O appimagetool
+          chmod +x appimagetool
+
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+            ./appimagetool --no-appstream AppDir polished-map-linux.AppImage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polished-map-linux
+          path: polished-map-linux.AppImage
+
+  # ── Windows ───────────────────────────────────────────────────────────────
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Checkout FLTK
+        uses: actions/checkout@v4
+        with:
+          repository: fltk/fltk
+          ref: release-1.4.4
+          path: lib/fltk
+          fetch-depth: 1
+
+      - name: Build FLTK (x86/Win32)
+        run: |
+          cmake -S lib/fltk -B lib/fltk/build -A Win32 `
+            -DFLTK_GRAPHICS_GDIPLUS=OFF `
+            -DFLTK_BUILD_GL=OFF `
+            -DFLTK_BUILD_TEST=OFF `
+            -DFLTK_USE_SYSTEM_LIBPNG=OFF `
+            -DFLTK_USE_SYSTEM_ZLIB=OFF
+          cmake --build lib/fltk/build --config Release --target fltk_images
+
+      - name: Stage FLTK libraries and headers
+        run: |
+          # .lib files → lib\ (where the .vcxproj AdditionalLibraryDirectories points)
+          New-Item -ItemType Directory -Force -Path lib | Out-Null
+          Copy-Item lib/fltk/build/lib/Release/*.lib lib/
+
+          # Headers → include\FL\
+          New-Item -ItemType Directory -Force -Path include/FL | Out-Null
+          Copy-Item -Recurse lib/fltk/FL/* include/FL/
+          Copy-Item lib/fltk/build/FL/fl_config.h include/FL/
+
+      - name: Build Polished Map
+        run: msbuild ide/polished-map.sln /p:Configuration=Release /p:Platform=Win32 /m /nologo
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item bin/Release/polishedmap.exe dist/
+          Copy-Item install.bat dist/
+          Compress-Archive -Path dist/* -DestinationPath polished-map-windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polished-map-windows
+          path: polished-map-windows.zip
+
+  # ── macOS ─────────────────────────────────────────────────────────────────
+
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout FLTK
+        uses: actions/checkout@v4
+        with:
+          repository: fltk/fltk
+          ref: release-1.4.4
+          path: lib/fltk
+          fetch-depth: 1
+
+      - name: Build FLTK
+        working-directory: lib/fltk
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_INSTALL_PREFIX="$(realpath "$PWD/../..")" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DFLTK_BUILD_GL=OFF \
+            -DFLTK_BUILD_TEST=OFF \
+            -DFLTK_USE_SYSTEM_LIBPNG=OFF \
+            -DFLTK_USE_SYSTEM_ZLIB=OFF
+          cmake --build build --parallel
+          cmake --install build
+
+      - name: Build Polished Map
+        run: make
+
+      - name: Package as .app bundle
+        run: |
+          VERSION=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' src/version.h | head -1)
+          APP="Polished Map.app"
+
+          mkdir -p "$APP/Contents/MacOS"
+          cp bin/polishedmap "$APP/Contents/MacOS/polishedmap"
+
+          cat > "$APP/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key>
+            <string>Polished Map</string>
+            <key>CFBundleDisplayName</key>
+            <string>Polished Map</string>
+            <key>CFBundleExecutable</key>
+            <string>polishedmap</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.rangi.polished-map</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${VERSION}</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          zip -r polished-map-macos.zip "$APP"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: polished-map-macos
+          path: polished-map-macos.zip
+
+  # ── Release ───────────────────────────────────────────────────────────────
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            polished-map-linux/polished-map-linux.AppImage
+            polished-map-windows/polished-map-windows.zip
+            polished-map-macos/polished-map-macos.zip
