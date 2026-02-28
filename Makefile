@@ -17,7 +17,12 @@ bindir = bin
 fltk-config = $(bindir)/fltk-config
 
 CXXFLAGS := -std=c++17 -I$(srcdir) -I$(resdir) $(shell $(fltk-config) --use-images --cxxflags) $(CXXFLAGS)
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S), Linux)
 LDFLAGS := $(shell $(fltk-config) --use-images --ldstaticflags) $(shell pkg-config --libs xpm) $(LDFLAGS)
+else
+LDFLAGS := $(shell $(fltk-config) --use-images --ldstaticflags) $(LDFLAGS)
+endif
 
 RELEASEFLAGS = -DNDEBUG -O3 -flto
 DEBUGFLAGS = -DDEBUG -D_DEBUG -O0 -g -ggdb3 -Wall -Wextra -pedantic -Wno-unknown-pragmas -Wno-sign-compare -Wno-unused-parameter
